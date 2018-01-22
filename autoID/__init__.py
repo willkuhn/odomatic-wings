@@ -106,6 +106,7 @@ from . utils import *
 from . classifier import *
 
 
-__version__ = '1.0'
+__version__ = '0.1.0'
+__author__ = "William R Kuhn, willkuhn@crossveins.com"
 __all__ = [s for s in dir()]
 #__all__ = [s for s in dir() if not s.startswith('_')]
