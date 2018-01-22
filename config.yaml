@@ -1,0 +1,54 @@
+# Config file for wing-based automatic odonate identification
+
+# Paths ------------------------------------------------------------------------
+image_path      : 'D:/Desktop/All scan images' # Path to training/testing images
+squares_path    : 'D:/Squares' #'D:/Desktop/All Py Squares' # Path to/for square (preprocessed) images
+features_path   : 'features.csv' # Path to table containing extracted features
+metadata_path   : 'metadata.csv' # Path to table with species names, etc. for each file
+clf_setup_path  : 'classifier_setup.py' # Path to classifier setup file
+model_path      : 'models_for_id' # Path to saved species classif models
+mask_model_path : 'models_for_masking' # Path to saved masking models
+images_for_masking_model_path : 'D:/TOWD test images for wing-masking' # Path to images for getting masking training data
+masking_data_path : 'data_for_masking_model.csv' # Path to data for training masking model
+
+# Log paths
+log_preproc_path : 'log_image_preprocessing.csv'
+log_extract_path : 'log_feature_extraction.csv'
+
+# Linux paths ------------------------------------------------------------------
+image_lpath : '/media/sf_All_scan_images' # Path to training/testing images
+squares_lpath : '/media/sf_Squares' #'D:/Squares' # Path to/for square (preprocessed) images
+# Log paths
+log_preproc_lpath : '/media/sf_odomatic-wings/log_image_preprocessing.csv'
+log_extract_lpath : '/media/sf_odomatic-wings/log_feature_extraction.csv'
+
+# Class assignment -------------------------------------------------------------
+# Classes can be created from individuals' genus, genus+species or
+# genus+species+sex. Individuals from small classes can be reassigned to a
+# separate class, 'rare_unknown', according to minClassSize, and 'rare_unknown'
+# may be discarded with extraClass=False.
+groupClassBy : ['Genus','Species']#,'Sex'] # how to group individuals
+minClassSize : 30 # Min no. of indivs a class must have, otherwise it's reassigned to rare_unknown
+extraClass : True # Include the rare_unknown class?
+
+# Training-testing set parsing -------------------------------------------------
+# Proportion of individuals per class to use for training vs testing
+ttf : 0.9 # Proportion of indivs per class to use in training set
+# Whether to limit class size to no more than the median original class size
+# This helps when `rare_unknown` class is much larger than other classes
+chop_large_classes : True
+
+
+# Feature processing -----------------------------------------------------------
+n_components : 200 # No. of principal components to keep during ordination
+
+# Classification algorithm -----------------------------------------------------
+
+# Which classification algorithm to use (refer to file in `clf_setup_path`)
+clfMethod : 'rf' # Random Forest, calibrated & optimized
+#clfMethod : 'nb' # Naive Bayes, calibrated, can't be optimized
+#clfMethod : 'svm_rbf_g' # SVM with RBF kernel, optimized for genus
+#clfMethod : 'svm_rbf_gs' # SVM with RBF kernel, optimized for genus+species or genus+species+sex
+#clfMethod : 'svm_lin' # SVM with linear kernel, optimized
+#clfMethod : 'nn_log' # Bernoulli RBM NeuralNetwork + Logistic Regression, calibrated & optimized
+#clfMethod : 'nn_svm' # Bernoulli RBM NeuralNetwork + Linear SVM
