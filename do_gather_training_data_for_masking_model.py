@@ -3,7 +3,7 @@ UI to gather positive & negative training examples for training
 the masking model
 
 Note: Full scratch script with extra analyses located at:
-WING SCANING PROJECT/dev/scratch-masking.py
+WING SCANNING PROJECT/dev/scratch-masking.py
 
 @author: Will
 """
