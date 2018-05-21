@@ -8,7 +8,7 @@ metadata_path   : 'metadata.csv' # Path to table with species names, etc. for ea
 clf_setup_path  : 'classifier_setup.py' # Path to classifier setup file
 model_path      : 'models_for_id' # Path to saved species classif models
 mask_model_path : 'models_for_masking' # Path to saved masking models
-images_for_masking_model_path : 'D:/TOWD test images for wing-masking' # Path to images for getting masking training data
+images_for_masking_model_path : 'D:/TOWD_test_images_for_wing_masking' # Path to images for getting masking training data
 masking_data_path : 'data_for_masking_model.csv' # Path to data for training masking model
 
 # Log paths
