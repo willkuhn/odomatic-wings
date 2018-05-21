@@ -13,8 +13,10 @@ from skimage.morphology import convex_hull_image
 from skimage.measure import regionprops, label
 from sklearn.externals import joblib
 from .utils import resize,pyramid,sliding_window
+from skimage.filters import roberts
+from skimage.color import rgb2gray
 
-# Functions for pre-masking image transformation ===============================
+# Masking-related functions ===================================================
 
 def michelson_constrast(arr):
     """Calculates Michelson's contrast for an array of intensity values:
@@ -119,8 +121,338 @@ def transparency_transform(image,bgr=False):
     e10 = cv2.blur(cv2.Canny(yy,100,200),(21,21))
     return np.dstack([cr,cb,s,mc6,mc12,e10])
 
+def convex_hulls_image(binary_image):
+    """Wrapper for skimage.morphology.convex_hull_image that applies that
+    function to each object in the image, separately, returning a single bool
+    image"""
 
-# Functions supporting the Standardizer class ==================================
+    labeled = label(binary_image)
+    indices = np.unique(labeled)[1:] # ignore first index (zero == background)
+    true = np.ones(binary_image.shape,dtype=np.uint8)
+    false = np.zeros(binary_image.shape,dtype=np.uint8)
+    out = false.copy()
+    for idx in indices:
+        temp = np.where(labeled==idx,true,false)
+        temp = convex_hull_image(temp) #Compute hull image
+        out[temp] = True
+    return out
+
+def clear_border(binary_image, buffer_size=0, amt=0., bgval=0, in_place=False):
+    """Remove objects connected to the image border.
+
+    Parameters
+    ----------
+    labels : (M, N[, P]) array of int or bool
+        Binary or labeled image.
+    buffer_size : int, optional
+        The width of the border examined.  By default, only objects
+        that touch the outside of the image are removed.
+    amt : float, optional
+        Min threshold for how much of the border an object must span to be
+        removed. By default, objects with any pixels in the border are removed.
+    bgval : float or int, optional
+        Cleared objects are set to this value.
+    in_place : bool, optional
+        Whether or not to manipulate the image array in-place.
+
+    Returns
+    -------
+    out : (M, N[, P]) array
+        Imaging data labels with cleared borders
+
+    Adapted from `skimage.segmentation.clear_border()`
+    """
+    image = binary_image
+
+    if any( ( buffer_size >= s for s in image.shape)):
+        raise ValueError("buffer size may not be greater than image size")
+
+    # create border mask using buffer_size
+    borders = np.zeros_like(image, dtype=np.bool_)
+    ext = buffer_size + 1
+    slstart = slice(ext)
+    slend   = slice(-ext, None)
+    slices  = [slice(s) for s in image.shape]
+    for d in range(image.ndim):
+        slicedim = list(slices)
+        slicedim[d] = slstart
+        borders[slicedim] = True
+        slicedim[d] = slend
+        borders[slicedim] = True
+
+    # Re-label, in case we are dealing with a binary image
+    # and to get consistent labeling
+    labels = label(image, background=0)
+    number = np.max(labels) + 1
+
+    bs = 1 if buffer_size==0 else buffer_size
+    indices = np.arange(number + 1)
+    proportions = [0] # set background proportion to zero
+    for idx in indices[1:]:
+        object_mask = np.where(labels==idx,np.ones(labels.shape),np.zeros(labels.shape))
+        flat_borders = np.hstack((  object_mask[:bs],               # top
+                                    object_mask[bs:-bs,-bs:].T,     # right
+                                    object_mask[-bs:],              # bottom
+                                    object_mask[bs:-bs,:bs].T))     # left
+
+        flat_borders = np.any(flat_borders,axis=0) # collapse by columns, cast to bool
+        # calc proportion of border cols/rows that are ones
+        prop = len(flat_borders[flat_borders]) / float(len(flat_borders))
+        proportions.append(prop)
+    borders_indices = indices[np.array(proportions)>amt]
+
+    # mask all label indices that are connected to borders
+    label_mask = np.in1d(indices, borders_indices)
+    # create mask for pixels to clear
+    mask = label_mask[labels.ravel()].reshape(labels.shape)
+
+    if not in_place:
+        image = image.copy()
+
+    # clear border pixels
+    image[mask] = bgval
+
+    return image
+
+def _masker_v1(rgb_image,n_wings,scaler,clf,convex_hull=False,bgr=False):
+    """Detect & mask wings in an image.
+
+    Steps: (1) transform image to a get 6-len feature vector per pixel
+           (2) apply trained classifier to predict whether each pixel is a wing
+           (3) fill in holes in predicted mask
+           (4) filter out all but largest `n_wings` regions in mask
+           (5) optionally apply convex_hull_image to each kept region
+
+    Parameters
+    ----------
+    rgb_image : uint8 array, shape (h,w,3)
+        Input image. Channels must be ordered RGB (not cv2's BGR)!
+    n_wings : int (1 or 2 typically)
+        The number of wings to find and mask in `rgb_image`
+    convex_hull : bool, optional (default False)
+        Whether to return the convex hull of each object in the mask
+
+    Returns
+    -------
+    mask : bool array, shape (h,w)
+        Image mask, where `n_wings` objects (wings) are True and background
+        pixels are False
+
+    Raises RuntimeError if the number of recovered regions < n_wings.
+    """
+
+    batch_size_limit = 50000 # lower if raises MemoryError
+
+    # Transform image to features for each pixel
+    img_trans = transparency_transform(rgb_image)
+    h,w,d = img_trans.shape # dims of transformed image
+
+    # Flatten to shape (n_pixels,n_features)
+    pixels = img_trans.reshape((h*w,d))
+
+    # Predict whether each pixel is a wing
+    batch_size = int(batch_size_limit/d)
+    if len(pixels)>batch_size: # work in batches to prevent MemoryError
+        # NOTE: uint8->float64 makes scaler transform memory intensive
+
+        divs = int(len(pixels)/batch_size) # `divs`+1 batches will be used
+        predicted = np.zeros((h*w),dtype=bool) # empty array to hold prediction
+
+        for div in range(divs+1):
+            if div<divs: # work with all but last batch
+                batch = pixels[batch_size*div:batch_size*(div+1)]
+                batch = batch.astype(np.float64) # cast to float for scaler
+                batch = scaler.transform(batch)
+                predicted[batch_size*div:batch_size*(div+1)] = clf.predict(batch)
+
+            elif (len(pixels)%batch_size)>0: # last batch, if any remaining
+                batch = pixels[batch_size*div:batch_size*(div+1)]
+                batch = batch.astype(np.float64) # cast to float for scaler
+                batch = scaler.transform(batch)
+                predicted[-(len(pixels)%batch_size):] = clf.predict(batch)
+
+    else: # if image is small, predict in a single go
+        predicted = clf.predict(pixels)
+
+    # Reshape back to image dims
+    predicted_mask = predicted.reshape((h,w))
+
+    # Do morphological hole filling
+    filled_mask = nd.binary_fill_holes(predicted_mask) #Hole filling
+
+    # Find regions in image and determine which to keep
+    labeled_mask = label(filled_mask) #Label objects in bool image
+    props = regionprops(labeled_mask) # region properties
+    areas = [region['area'] for region in props]
+    labels = np.unique(labeled_mask)
+    labels = labels[1:] # drop region `0` (= image background)
+    if len(labels)<n_wings: # catch if there aren't enough labeled regions
+        raise RuntimeError('An insufficient number of objects was detected in image.')
+    # keep only the `n_wings` regions that have the largest pixel area
+    labels_to_keep = labels[np.argsort(areas)][-n_wings:]
+
+    # Fill in empty mask with only the regions in labels_to_keep
+    mask = np.zeros(labeled_mask.shape,dtype=int)
+    for lbl in labels_to_keep:
+        mask[labeled_mask==lbl] = lbl
+
+    # apply convex hull to objects in image
+    if convex_hull:
+        mask = convex_hulls_image(mask)
+
+        return mask.astype(bool)
+
+def _masker_v4_2(rgb_image,n_wings,convex_hull=False,bgr=False):
+    # reference: https://docs.opencv.org/3.3.1/d3/db4/tutorial_py_watershed.html
+
+    ## detect edges in image
+    edges = roberts(rgb2gray(rgb_image))
+    edges *= 255./edges.max()
+    edges = edges.astype(np.uint8)
+
+    ## Distance transform edge map
+    # Threshold & invert the image, so background is 0 and foreground is 1
+    _,thresh = cv2.threshold(edges,0,255,cv2.THRESH_TRIANGLE+cv2.THRESH_BINARY_INV)
+    # Distance transform: wing regions will be local minima
+    dist = cv2.distanceTransform(thresh,cv2.DIST_L2,3)
+    # Threshold again to catch those low-value regions
+    _,thresh = cv2.threshold(dist,0.02*dist.max(),1.,cv2.THRESH_BINARY_INV)
+
+    ## remove objects on border of image (possibly unnecessary)
+    thresh = clear_border(thresh,buffer_size=25,amt=0.1)
+
+    ## fill holes in remaining objects
+    filled = nd.binary_fill_holes(thresh) #Hole filling
+
+    ## remove small components (do this first!)
+    labeled = label( filled.astype(bool) )
+    areas = np.array([obj['area'] for obj in regionprops(labeled)])
+    min_area = 3000 # min px area of objects to keep
+    nix = np.arange(1,len(areas)+1)[areas<min_area]
+    for i in nix:
+        labeled[labeled==i] = 0
+
+    thresh = labeled>0 # cast back to bool
+    thresh = thresh.astype(np.uint8)*255
+    ## compute watershed components
+    # noise removal
+    kernel = np.ones((3,3),np.uint8)
+    opening = cv2.morphologyEx(thresh,cv2.MORPH_OPEN,kernel, iterations = 2)
+    # sure background area
+    sure_bg = cv2.dilate(opening,kernel,iterations=3)
+    # Finding sure foreground area
+    dist_transform = cv2.distanceTransform(opening,cv2.DIST_L2,5)
+    ret, sure_fg = cv2.threshold(dist_transform,0.2*dist_transform.max(),255,0)
+    # Finding unknown region
+    sure_fg = np.uint8(sure_fg)
+    unknown = cv2.subtract(sure_bg,sure_fg)
+    # Marker labelling
+    ret, markers = cv2.connectedComponents(sure_fg)
+    # Add one to all labels so that sure background is not 0, but 1
+    markers = markers+1
+    # Now, mark the region of unknown with zero
+    markers[unknown==255] = 0
+    watershed = cv2.watershed(rgb_image,markers.copy())
+    water_mask = np.zeros(markers.shape,dtype=np.uint8)
+    water_mask[watershed > 1] = 255 # bg is 1, candidate objects are >1, contours are -1
+
+    ## count remaining components
+    labeled = label( water_mask.astype(bool) )
+    nn = len(np.unique(labeled))-1 # no. remaining components
+
+    if nn<n_wings: # not enough objects remain in image
+        raise RuntimeError('An insufficient number of objects was detected in image.')
+        #if len(np.unique(labeled))-1 >= nn+1, one of the wings was likely touching the image border
+
+    ## keep only `n_wings` largest objects
+    areas = np.array([obj['area'] for obj in regionprops(labeled)])
+    keep = (np.argsort(areas)+1)[-n_wings:]
+    largest_objs = np.zeros(thresh.shape,dtype=bool)
+    for i in keep:
+        largest_objs[labeled==i] = True
+
+    # apply convex hull to objects in image
+    if convex_hull:
+        largest_objs = convex_hulls_image(largest_objs)
+
+    return largest_objs.astype(bool)
+
+def _masker_v4_3(rgb_image,n_wings,convex_hull=False,bgr=False):
+    # reference: https://docs.opencv.org/3.3.1/d3/db4/tutorial_py_watershed.html
+
+    ## detect edges in image
+    edges = roberts(rgb2gray(rgb_image))
+    edges *= 255./edges.max()
+    edges = edges.astype(np.uint8)
+
+    ## Distance transform edge map
+    # Threshold & invert the image, so background is 0 and foreground is 1
+    _,thresh = cv2.threshold(edges,0,255,cv2.THRESH_TRIANGLE+cv2.THRESH_BINARY_INV)
+    # Distance transform: wing regions will be local minima
+    dist = cv2.distanceTransform(thresh,cv2.DIST_L2,3)
+    # Threshold again to catch those low-value regions
+    _,thresh = cv2.threshold(dist,0.02*dist.max(),1.,cv2.THRESH_BINARY_INV)
+
+    ## remove objects on border of image (possibly unnecessary)
+    thresh = clear_border(thresh,buffer_size=25,amt=0.1)
+
+    ## fill holes in remaining objects
+    filled = nd.binary_fill_holes(thresh) #Hole filling
+
+    ## remove small components (do this first!)
+    labeled = label( filled.astype(bool) )
+    areas = np.array([obj['area'] for obj in regionprops(labeled)])
+    min_area = 3000 # min px area of objects to keep
+    nix = np.arange(1,len(areas)+1)[areas<min_area]
+    for i in nix:
+        labeled[labeled==i] = 0
+
+    thresh = labeled>0 # cast back to bool
+    thresh = thresh.astype(np.uint8)*255
+    ## compute watershed components
+    # noise removal
+    kernel = np.ones((3,3),np.uint8)
+    opening = cv2.morphologyEx(thresh,cv2.MORPH_OPEN,kernel,iterations=2)
+    # sure background area
+    sure_bg = cv2.dilate(opening,kernel,iterations=10)
+    # Finding sure foreground area
+    dist_transform = cv2.distanceTransform(opening,cv2.DIST_L2,5)
+    ret, sure_fg = cv2.threshold(dist_transform,0.1*dist_transform.max(),255,0)
+    # Finding unknown region
+    sure_fg = np.uint8(sure_fg)
+    unknown = cv2.subtract(sure_bg,sure_fg)
+    # Marker labelling
+    ret, markers = cv2.connectedComponents(sure_fg)
+    # Add one to all labels so that sure background is not 0, but 1
+    markers = markers+1
+    # Now, mark the region of unknown with zero
+    markers[unknown==255] = 0
+    watershed = cv2.watershed(rgb_image,markers.copy())
+    water_mask = np.zeros(markers.shape,dtype=np.uint8)
+    water_mask[watershed > 1] = 255 # bg is 1, candidate objects are >1, contours are -1
+
+    ## count remaining components
+    labeled = label( water_mask.astype(bool) )
+    nn = len(np.unique(labeled))-1 # no. remaining components
+
+    if nn<n_wings: # not enough objects remain in image
+        raise RuntimeError('An insufficient number of objects was detected in image.')
+        #if len(np.unique(labeled))-1 >= nn+1, one of the wings was likely touching the image border
+
+    ## keep only `n_wings` largest objects
+    areas = np.array([obj['area'] for obj in regionprops(labeled)])
+    keep = (np.argsort(areas)+1)[-n_wings:]
+    largest_objs = np.zeros(thresh.shape,dtype=bool)
+    for i in keep:
+        largest_objs[labeled==i] = True
+
+    # apply convex hull to objects in image
+    if convex_hull:
+        largest_objs = convex_hulls_image(largest_objs)
+
+    return largest_objs.astype(bool)
+
+# Functions supporting the Standardizer class =================================
 
 def _check_image_mask_match(image,mask):
     return image.shape[:2]==mask.shape
@@ -390,6 +722,7 @@ def pad_and_stack(image_list,height=256,background='k'):
 
     return np.vstack(padded_list)
 
+
 # STANDARDIZER CLASS============================================================
 
 # By using this class, the scaler/clf models only have to be loaded once for
@@ -400,13 +733,15 @@ class Standardizer:
 
     Parameters
     ----------
-    scaler_fp : str
+    mask_method : str {`v1`|`v4_2`,`v4_3`}, default None
+        Method for wing-masking. v1 for _masker_v1(), etc. None uses latest.
+    scaler_fp : str|None, default None
         Filepath to pickle of pre-trained sklearn.preprocessing.StandardScaler()
-        object
-    clf_fp : str
+        object. Needed for mask_method=`v1`
+    clf_fp : str|None, default None
         Filepath to pickle of sklearn classifier, pre-trained to classify
         transformed pixels of `image` as either True (for foreground pixels)
-        or False (for background pixels)
+        or False (for background pixels). Needed for mask_method=`v1`
     background : ('k'|'w'), optional (default 'k')
         Desired background color for standardized square.
         'k' for black or 'w' for white.
@@ -421,12 +756,12 @@ class Standardizer:
     Attributes
     ----------
     scaler_ : sklearn.preprocessing.StandardScaler object
-        Instance of a pre-trained StandardScaler object.
+        Instance of a pre-trained StandardScaler object. Needed for _masker_v1()
     clf_ : sklearn classifier object
         Instance of a pre-trained classifier object that accepts pixel-wise
         features vectors from `transparency_transform(image)` and outputs True
         for pixels that are predicted to be from a wing and False for background
-        pixels.
+        pixels. Needed only for _masker_v1()
 
     Methods
     -------
@@ -442,18 +777,19 @@ class Standardizer:
     square = squarer.make_square(img) # convert to standardized square
     """
 
-    def __init__(self,scaler_fp,clf_fp,background='k',convex_hull=True,
+    def __init__(self,mask_method=None,scaler_fp=None,clf_fp=None,background='k',convex_hull=False,
                  bgr=False):
         self.background     = background
         self.convex_hull    = convex_hull
         self.bgr            = bgr
+        self.mask_method    = mask_method
 
-        # load models
-        self.scaler_         = _load_model(scaler_fp)
-        self.clf_            = _load_model(clf_fp)
+        # load models (needed only for _masker_v1(), ignored otherwise)
+        self.scaler_         = _load_model(scaler_fp) if scaler_fp else None
+        self.clf_            = _load_model(clf_fp) if clf_fp else None
 
-    def mask_wings(self,image,n_wings=2):
-        """Detect & mask wings in an image.
+    def mask_wings(self,image,n_wings,method=None):
+        """Wrapper for masking methods. Detect & mask wings in an image.
 
         Steps: (1) transform image to a get 6-len feature vector per pixel
                (2) apply trained classifier to predict whether each pixel is a wing
@@ -467,6 +803,9 @@ class Standardizer:
             Input image. Channels must be ordered RGB (not cv2's BGR)!
         n_wings : int, optional (default 2)
             The number of wings to find and mask in `image`
+        method : `v4_3`|`v4_2`|`v1`|`latest`|None, optional (default None)
+            Which masking function to use. None & `latest` use latest function,
+            or specify function by version number.
 
         Returns
         -------
@@ -476,77 +815,20 @@ class Standardizer:
 
         Raises RuntimeError if the number of recovered regions < n_wings.
         """
-        scaler      = self.scaler_
-        clf         = self.clf_
+        convex_hull = self.convex_hull
 
-        batch_size_limit = 50000 # lower if raises MemoryError
-
-        if self.bgr: # convert image from BGR -> RGB
-            image = cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
-
-        # Transform image to features for each pixel
-        img_trans = transparency_transform(image)
-        h,w,d = img_trans.shape # dims of transformed image
-
-        # Flatten to shape (n_pixels,n_features)
-        pixels = img_trans.reshape((h*w,d))
-
-        # Predict whether each pixel is a wing
-        batch_size = int(batch_size_limit/d)
-        if len(pixels)>batch_size: # work in batches to prevent MemoryError
-            # NOTE: uint8->float64 makes scaler transform memory intensive
-
-            divs = int(len(pixels)/batch_size) # `divs`+1 batches will be used
-            predicted = np.zeros((h*w),dtype=bool) # empty array to hold prediction
-
-            for div in range(divs+1):
-                if div<divs: # work with all but last batch
-                    batch = pixels[batch_size*div:batch_size*(div+1)]
-                    batch = batch.astype(np.float64) # cast to float for scaler
-                    batch = scaler.transform(batch)
-                    predicted[batch_size*div:batch_size*(div+1)] = clf.predict(batch)
-
-                elif (len(pixels)%batch_size)>0: # last batch, if any remaining
-                    batch = pixels[batch_size*div:batch_size*(div+1)]
-                    batch = batch.astype(np.float64) # cast to float for scaler
-                    batch = scaler.transform(batch)
-                    predicted[-(len(pixels)%batch_size):] = clf.predict(batch)
-
-        else: # if image is small, predict in a single go
-            predicted = clf.predict(pixels)
-
-        # Reshape back to image dims
-        predicted_mask = predicted.reshape((h,w))
-
-        # Do morphological hole filling
-        filled_mask = nd.binary_fill_holes(predicted_mask) #Hole filling
-
-        # Find regions in image and determine which to keep
-        labeled_mask = label(filled_mask) #Label objects in bool image
-        props = regionprops(labeled_mask) # region properties
-        areas = [region['area'] for region in props]
-        labels = np.unique(labeled_mask)
-        labels = labels[1:] # drop region `0` (= image background)
-        if len(labels)<n_wings: # catch if there aren't enough labeled regions
-            raise RuntimeError('An insufficient number of objects was detected in image.')
-        # keep only the `n_wings` regions that have the largest pixel area
-        labels_to_keep = labels[np.argsort(areas)][-n_wings:]
-
-        # Fill in empty mask with only the regions in labels_to_keep
-        mask = np.zeros(labeled_mask.shape,dtype=int)
-        for lbl in labels_to_keep:
-            mask[labeled_mask==lbl] = lbl
-
-        # Optionally, apply convex_hull_image to each region in mask
-        if self.convex_hull:
-            for lbl in labels_to_keep:
-                temp = np.zeros(mask.shape,dtype=int)
-                temp[mask==lbl] = 1
-                temp = convex_hull_image(temp) #Compute hull image
-                mask[temp==1] = lbl
-
-        return mask.astype(bool)
-
+        if (method is None) or (method in ['latest','v4_3']): # use latest masking method
+            return _masker_v4_3(image,n_wings,convex_hull)
+        elif method=='v4_2': # use v4.2
+            return _masker_v4_2(image,n_wings,convex_hull)
+        elif method=='v1': # use version 1 masking method
+            scaler      = self.scaler_
+            clf         = self.clf_
+            if clf is None or scaler is None: # check that clf & scaler are provided
+                raise ValueError('Scaler and classifier must be provided for mask_method=`v1`.')
+            return _masker_v1(image,n_wings,scaler,clf,convex_hull)
+        else:
+            raise ValueError('Masking method {!r} not recognized.')
 
     def make_square(self, image1, mask1=None, image2=None, mask2=None,
                     flip=False, switch=False):
